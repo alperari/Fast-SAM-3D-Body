@@ -212,6 +212,12 @@ def main():
     )
 
     parser.add_argument(
+        "--mv_model_path",
+        default=str(MHR2SMPL_DIR /
+                    "experiments/multiview_n30000_e500/best_model.pth"),
+        help="multi-view model checkpoint path",
+    )
+    parser.add_argument(
         "--mapping_path",
         default=str(MHR2SMPL_DIR / "data/mhr2smpl_mapping.npz"),
         help="MHR->SMPL mapping npz",
@@ -228,8 +234,14 @@ def main():
     )
     parser.add_argument(
         "--smoother_dir",
-        default=None,
+        default=str(MHR2SMPL_DIR /
+                    "experiments/smoother_w5"),
         help="optional SmootherMLP directory",
+    )
+    parser.add_argument(
+        "--use_smoother",
+        action="store_true",
+        help="apply SmootherMLP via infer_smpl_joints (joint denoising)",
     )
     parser.add_argument(
         "--device",
@@ -317,8 +329,11 @@ def main():
 
     print("[3/4] Multi-view fusion (MHR2SMPL)...")
     mv_model = MHR2SMPLMultiView(
-        model_path="mhr2smpl/experiments/multiview_n30000_e500/best_model.pth",
-        smoother_dir="mhr2smpl/experiments/smoother_w5",  # optional
+        model_path=args.mv_model_path,
+        mapping_path=args.mapping_path,
+        sample_idx_path=args.sample_idx_path,
+        device=args.device,
+        smoother_dir=args.smoother_dir,
     )
     views = [
         (np.asarray(pred0["pred_vertices"], dtype=np.float32),
@@ -326,7 +341,15 @@ def main():
         (np.asarray(pred1["pred_vertices"], dtype=np.float32),
          np.asarray(pred1["pred_cam_t"], dtype=np.float32)),
     ]
-    go, body_pose, betas, weights = mv_model.infer(views)
+    smoothed_joints = None
+    if args.use_smoother:
+        if args.smoother_dir is None:
+            raise ValueError("--use_smoother requires --smoother_dir")
+        go, body_pose, betas, weights, smoothed_joints = mv_model.infer_smpl_joints(
+            views, smpl_model_path=args.smpl_model_path
+        )
+    else:
+        go, body_pose, betas, weights = mv_model.infer(views)
 
     print("[4/4] Building canonical SMPL mesh...")
     patch_chumpy_compat()
@@ -351,6 +374,8 @@ def main():
     vertices = out.vertices[0].detach().cpu().numpy().astype(np.float32)
     joints = out.joints[0, :24].detach().cpu().numpy().astype(np.float32)
     joints -= joints[0:1]
+    if smoothed_joints is not None:
+        joints = np.asarray(smoothed_joints, dtype=np.float32)
     faces = np.asarray(smpl.faces, dtype=np.int32)
 
     save_obj(out_dir / "smpl_mesh.obj", vertices, faces)
@@ -373,6 +398,9 @@ def main():
     print(f"  Result npz:  {out_dir / 'result_two_view.npz'}")
     print(f"  Mesh obj:    {out_dir / 'smpl_mesh.obj'}")
     print(f"  View weights: [{weights[0]:.3f}, {weights[1]:.3f}]")
+    if args.use_smoother:
+        print("  Smoother: enabled (joint denoising applied).")
+        print("  Note: for only two still images, temporal smoothing has limited effect.")
     print("  Note: exported mesh is canonical/root-relative (global_orient set to zero).")
 
 
