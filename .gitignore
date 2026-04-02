@@ -15,3 +15,6 @@ checkpoints/**/*.plan
 checkpoints/**/*_trt/
 
 /output
+
+multi-view-data/
+multi-view-output/
