@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """
-Run multi-view MHR2SMPL inference from exactly two images.
+Run multi-view MHR2SMPL inference from N images in a folder.
 
 Pipeline:
-  image0,image1
+  image_dir (N camera views of the same frame)
     -> SAM-3D-Body Stage1 per image (pred_vertices, pred_cam_t)
     -> MHR2SMPL multi-view fusion
     -> SMPL canonical mesh export (.obj) + parameters (.npz)
 
 Example:
   python mhr2smpl/multi_view/infer_two_images.py \
-      --image0 /path/to/cam0.jpg \
-      --image1 /path/to/cam1.jpg \
-      --intrinsics0 /path/to/cam0_intrinsics.json \
-      --intrinsics1 /path/to/cam1_intrinsics.json \
-      --output_dir mhr2smpl/output_two_images
+      --input_dir /path/to/multiview_images \
+      --intrinsics_dir /path/to/intrinsics \
+      --output_dir mhr2smpl/output_multi_images
+
+Uncalibrated quick-start:
+  python mhr2smpl/multi_view/infer_two_images.py \
+      --input_dir /path/to/multiview_images \
+      --uncalibrated \
+      --output_dir mhr2smpl/output_multi_images_uncalib
 """
 # fmt: off
 from infer_multiview import MHR2SMPLMultiView
@@ -32,9 +36,6 @@ from notebook.utils import setup_sam_3d_body
 import argparse
 import inspect
 import json
-import os
-import sys
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -57,6 +58,44 @@ def build_default_cam_int(width: int, height: int, focal: float) -> np.ndarray:
         [[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]],
         dtype=np.float32,
     )
+
+
+def estimate_focal_from_fov(width: int, height: int, fov_deg: float) -> float:
+    # Approximate pinhole focal from horizontal FOV and image width.
+    if fov_deg <= 1.0 or fov_deg >= 179.0:
+        raise ValueError(f"default_fov_deg must be in (1, 179), got {fov_deg}")
+    half_fov_rad = np.deg2rad(fov_deg * 0.5)
+    return float((width * 0.5) / np.tan(half_fov_rad))
+
+
+def list_images(input_dir: str, pattern: str) -> list[Path]:
+    root = Path(input_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"input_dir is not a directory: {root}")
+
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    images = sorted(
+        [p for p in root.glob(pattern) if p.is_file() and p.suffix.lower() in exts]
+    )
+    if len(images) == 0:
+        raise FileNotFoundError(
+            f"no images found in {root} with pattern='{pattern}' and supported extensions {sorted(exts)}"
+        )
+    return images
+
+
+def find_intrinsics_for_image(image_path: Path, intrinsics_dir: str | None) -> str | None:
+    if intrinsics_dir is None:
+        return None
+    intr_dir = Path(intrinsics_dir)
+    if not intr_dir.is_dir():
+        raise FileNotFoundError(f"intrinsics_dir is not a directory: {intr_dir}")
+
+    for ext in (".json", ".npy", ".npz"):
+        cand = intr_dir / f"{image_path.stem}{ext}"
+        if cand.exists():
+            return str(cand)
+    return None
 
 
 def load_cam_int(path: str | None) -> np.ndarray | None:
@@ -177,23 +216,34 @@ def patch_chumpy_compat() -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Two-image multi-view MHR2SMPL inference")
-    parser.add_argument("--image0", required=True,
-                        help="Path to camera-0 image")
-    parser.add_argument("--image1", required=True,
-                        help="Path to camera-1 image")
-    parser.add_argument("--intrinsics0", default=None,
-                        help="cam0 intrinsics (.json/.npy/.npz)")
-    parser.add_argument("--intrinsics1", default=None,
-                        help="cam1 intrinsics (.json/.npy/.npz)")
-    parser.add_argument("--bbox0", default=None,
-                        help="cam0 bbox as x1,y1,x2,y2 (optional)")
-    parser.add_argument("--bbox1", default=None,
-                        help="cam1 bbox as x1,y1,x2,y2 (optional)")
-    parser.add_argument("--focal0", type=float,
-                        default=1000.0, help="default fx=fy for cam0")
-    parser.add_argument("--focal1", type=float,
-                        default=1000.0, help="default fx=fy for cam1")
+        description="Folder-based N-view MHR2SMPL inference")
+    parser.add_argument("--input_dir", required=True,
+                        help="Folder containing multiview images")
+    parser.add_argument(
+        "--image_glob",
+        default="*",
+        help="glob pattern inside input_dir (default: *)",
+    )
+    parser.add_argument(
+        "--intrinsics_dir",
+        default=None,
+        help="Optional folder with per-image intrinsics named <image_stem>.json/.npy/.npz",
+    )
+    parser.add_argument(
+        "--uncalibrated",
+        action="store_true",
+        help="synthesize intrinsics for all views (ignore intrinsics_dir)",
+    )
+    parser.add_argument("--bbox", default=None,
+                        help="single bbox x1,y1,x2,y2 applied to all images (optional)")
+    parser.add_argument("--focal", type=float,
+                        default=None, help="override fx=fy for all views (pixels)")
+    parser.add_argument(
+        "--default_fov_deg",
+        type=float,
+        default=55.0,
+        help="fallback horizontal FOV for synthesized intrinsics",
+    )
     parser.add_argument(
         "--local_checkpoint",
         default=str(PROJECT_DIR / "checkpoints/sam-3d-body-dinov3"),
@@ -250,7 +300,7 @@ def main():
     )
     parser.add_argument(
         "--output_dir",
-        default=str(MHR2SMPL_DIR / "output_two_images"),
+        default=str(MHR2SMPL_DIR / "output_multi_images"),
         help="output directory",
     )
     args = parser.parse_args()
@@ -258,24 +308,12 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    img0 = cv2.imread(args.image0)
-    img1 = cv2.imread(args.image1)
-    if img0 is None:
-        raise FileNotFoundError(f"failed to read image0: {args.image0}")
-    if img1 is None:
-        raise FileNotFoundError(f"failed to read image1: {args.image1}")
+    image_paths = list_images(args.input_dir, args.image_glob)
+    print(f"Found {len(image_paths)} input images in {args.input_dir}")
+    if len(image_paths) < 2:
+        print("  Warning: fewer than 2 views found; fusion falls back to single-view behavior.")
 
-    h0, w0 = img0.shape[:2]
-    h1, w1 = img1.shape[:2]
-    cam_int0 = load_cam_int(args.intrinsics0)
-    cam_int1 = load_cam_int(args.intrinsics1)
-    if cam_int0 is None:
-        cam_int0 = build_default_cam_int(w0, h0, args.focal0)
-    if cam_int1 is None:
-        cam_int1 = build_default_cam_int(w1, h1, args.focal1)
-
-    bbox0 = parse_bbox(args.bbox0)
-    bbox1 = parse_bbox(args.bbox1)
+    bbox_all = parse_bbox(args.bbox)
 
     detector_name = "" if args.detector == "none" else args.detector
     detector_model = args.detector_model
@@ -288,11 +326,11 @@ def main():
                 "Tried --detector_model and common defaults under checkpoints/yolo/.\n"
                 "Options:\n"
                 "  1) Provide valid weights with --detector_model\n"
-                "  2) Use --detector none and pass --bbox0/--bbox1 manually"
+                "  2) Use --detector none and pass --bbox manually"
             )
-    if args.detector == "none" and (bbox0 is None or bbox1 is None):
+    if args.detector == "none" and bbox_all is None:
         raise ValueError(
-            "--detector none requires both --bbox0 and --bbox1 "
+            "--detector none requires --bbox "
             "(format: x1,y1,x2,y2)."
         )
 
@@ -305,27 +343,51 @@ def main():
         device=args.device,
     )
 
-    print("[2/4] Running Stage-1 on both images...")
+    print(f"[2/4] Running Stage-1 on {len(image_paths)} images...")
     hand_box_source = "yolo_pose" if args.detector == "yolo_pose" else "body_decoder"
-    pred0 = infer_single_view(estimator, args.image0,
-                              bbox0, cam_int0, hand_box_source)
-    pred1 = infer_single_view(estimator, args.image1,
-                              bbox1, cam_int1, hand_box_source)
+    views = []
+    stage1_records = []
+    for i, img_path in enumerate(image_paths):
+        img = cv2.imread(str(img_path))
+        if img is None:
+            raise FileNotFoundError(f"failed to read image: {img_path}")
+        h, w = img.shape[:2]
 
-    np.savez(
-        out_dir / "stage1_cam0.npz",
-        image_path=args.image0,
-        cam_int=cam_int0,
-        pred_vertices=pred0["pred_vertices"],
-        pred_cam_t=pred0["pred_cam_t"],
-    )
-    np.savez(
-        out_dir / "stage1_cam1.npz",
-        image_path=args.image1,
-        cam_int=cam_int1,
-        pred_vertices=pred1["pred_vertices"],
-        pred_cam_t=pred1["pred_cam_t"],
-    )
+        intr_path = None if args.uncalibrated else find_intrinsics_for_image(
+            img_path, args.intrinsics_dir
+        )
+        cam_int = load_cam_int(intr_path)
+        if cam_int is None:
+            focal = (
+                float(args.focal)
+                if args.focal is not None
+                else estimate_focal_from_fov(w, h, args.default_fov_deg)
+            )
+            cam_int = build_default_cam_int(w, h, focal)
+            mode = "manual focal" if args.focal is not None else "estimated FOV"
+            print(f"  [{i}] {img_path.name}: synthesized intrinsics ({mode}), fx=fy={focal:.1f}")
+            intr_src = f"synthesized:{mode}"
+        else:
+            print(f"  [{i}] {img_path.name}: loaded intrinsics from {Path(intr_path).name}")
+            intr_src = str(intr_path)
+
+        pred = infer_single_view(
+            estimator, str(img_path), bbox_all, cam_int, hand_box_source
+        )
+        pred_vertices = np.asarray(pred["pred_vertices"], dtype=np.float32)
+        pred_cam_t = np.asarray(pred["pred_cam_t"], dtype=np.float32)
+        views.append((pred_vertices, pred_cam_t))
+
+        stage1_name = f"stage1_{i:03d}_{img_path.stem}.npz"
+        np.savez(
+            out_dir / stage1_name,
+            image_path=str(img_path),
+            cam_int=cam_int,
+            intrinsics_source=intr_src,
+            pred_vertices=pred_vertices,
+            pred_cam_t=pred_cam_t,
+        )
+        stage1_records.append(stage1_name)
 
     print("[3/4] Multi-view fusion (MHR2SMPL)...")
     mv_model = MHR2SMPLMultiView(
@@ -335,12 +397,6 @@ def main():
         device=args.device,
         smoother_dir=args.smoother_dir,
     )
-    views = [
-        (np.asarray(pred0["pred_vertices"], dtype=np.float32),
-         np.asarray(pred0["pred_cam_t"], dtype=np.float32)),
-        (np.asarray(pred1["pred_vertices"], dtype=np.float32),
-         np.asarray(pred1["pred_cam_t"], dtype=np.float32)),
-    ]
     smoothed_joints = None
     if args.use_smoother:
         if args.smoother_dir is None:
@@ -380,11 +436,12 @@ def main():
 
     save_obj(out_dir / "smpl_mesh.obj", vertices, faces)
     np.savez(
-        out_dir / "result_two_view.npz",
+        out_dir / "result_multi_view.npz",
         go=go.astype(np.float32),
         body_pose=body_pose.astype(np.float32),
         betas=betas.astype(np.float32),
         view_weights=weights.astype(np.float32),
+        image_paths=np.asarray([str(p) for p in image_paths]),
         joints_root_relative=joints,
         vertices=vertices,
         faces=faces,
@@ -393,14 +450,15 @@ def main():
     print("")
     print("Done.")
     print(f"  Output dir: {out_dir}")
-    print(f"  Stage1 cam0: {out_dir / 'stage1_cam0.npz'}")
-    print(f"  Stage1 cam1: {out_dir / 'stage1_cam1.npz'}")
-    print(f"  Result npz:  {out_dir / 'result_two_view.npz'}")
+    print(f"  Views processed: {len(image_paths)}")
+    print(f"  Stage1 files: {len(stage1_records)} saved (stage1_*.npz)")
+    print(f"  Result npz:  {out_dir / 'result_multi_view.npz'}")
     print(f"  Mesh obj:    {out_dir / 'smpl_mesh.obj'}")
-    print(f"  View weights: [{weights[0]:.3f}, {weights[1]:.3f}]")
+    weight_text = ", ".join([f"{float(w):.3f}" for w in weights])
+    print(f"  View weights: [{weight_text}]")
     if args.use_smoother:
         print("  Smoother: enabled (joint denoising applied).")
-        print("  Note: for only two still images, temporal smoothing has limited effect.")
+        print("  Note: for still images, temporal smoothing has limited effect.")
     print("  Note: exported mesh is canonical/root-relative (global_orient set to zero).")
 
 
