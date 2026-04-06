@@ -6,7 +6,7 @@ Pipeline:
   image_dir (N camera views of the same frame)
     -> SAM-3D-Body Stage1 per image (pred_vertices, pred_cam_t)
     -> MHR2SMPL multi-view fusion
-    -> SMPL canonical mesh export (.obj) + parameters (.npz)
+    -> Mesh export (.obj): SMPL and/or SAM-3D-Body MHR + parameters (.npz)
 
 Example:
   python mhr2smpl/multi_view/infer_two_images.py \
@@ -303,6 +303,16 @@ def main():
         default=str(MHR2SMPL_DIR / "output_multi_images"),
         help="output directory",
     )
+    parser.add_argument(
+        "--save_mhr_mesh",
+        action="store_true",
+        help="save per-view SAM-3D-Body MHR meshes as OBJ",
+    )
+    parser.add_argument(
+        "--skip_smpl_mesh",
+        action="store_true",
+        help="skip final SMPL OBJ export (still saves result npz unless disabled externally)",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -342,11 +352,13 @@ def main():
         fov_name=None,
         device=args.device,
     )
+    mhr_faces = np.asarray(estimator.faces, dtype=np.int32)
 
     print(f"[2/4] Running Stage-1 on {len(image_paths)} images...")
     hand_box_source = "yolo_pose" if args.detector == "yolo_pose" else "body_decoder"
     views = []
     stage1_records = []
+    mhr_mesh_records = []
     for i, img_path in enumerate(image_paths):
         img = cv2.imread(str(img_path))
         if img is None:
@@ -388,6 +400,11 @@ def main():
             pred_cam_t=pred_cam_t,
         )
         stage1_records.append(stage1_name)
+
+        if args.save_mhr_mesh:
+            mhr_obj_name = f"mhr_mesh_{i:03d}_{img_path.stem}.obj"
+            save_obj(out_dir / mhr_obj_name, pred_vertices, mhr_faces)
+            mhr_mesh_records.append(mhr_obj_name)
 
     print("[3/4] Multi-view fusion (MHR2SMPL)...")
     mv_model = MHR2SMPLMultiView(
@@ -434,7 +451,8 @@ def main():
         joints = np.asarray(smoothed_joints, dtype=np.float32)
     faces = np.asarray(smpl.faces, dtype=np.int32)
 
-    save_obj(out_dir / "smpl_mesh.obj", vertices, faces)
+    if not args.skip_smpl_mesh:
+        save_obj(out_dir / "smpl_mesh.obj", vertices, faces)
     np.savez(
         out_dir / "result_multi_view.npz",
         go=go.astype(np.float32),
@@ -452,8 +470,13 @@ def main():
     print(f"  Output dir: {out_dir}")
     print(f"  Views processed: {len(image_paths)}")
     print(f"  Stage1 files: {len(stage1_records)} saved (stage1_*.npz)")
+    if args.save_mhr_mesh:
+        print(f"  MHR meshes: {len(mhr_mesh_records)} saved (mhr_mesh_*.obj)")
     print(f"  Result npz:  {out_dir / 'result_multi_view.npz'}")
-    print(f"  Mesh obj:    {out_dir / 'smpl_mesh.obj'}")
+    if args.skip_smpl_mesh:
+        print("  Mesh obj:    skipped (--skip_smpl_mesh)")
+    else:
+        print(f"  Mesh obj:    {out_dir / 'smpl_mesh.obj'}")
     weight_text = ", ".join([f"{float(w):.3f}" for w in weights])
     print(f"  View weights: [{weight_text}]")
     if args.use_smoother:
